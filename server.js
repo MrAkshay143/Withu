@@ -17,11 +17,13 @@ function getOrCreateRoom(roomId) {
     if (!rooms.has(roomId)) {
         rooms.set(roomId, {
             clients: new Set(),
-            seats: new Array(MAX_SEATS).fill(null), // each seat: { user_id, username, name, profile_pic } or null
+            seats: new Array(MAX_SEATS).fill(null),
             chat: [],
             hostId: null,
             bannedCommenters: new Set(),
             mutedUsers: new Set(),
+            lockedSeats: new Set(),
+            selfMutedUsers: new Set(),
         });
     }
     return rooms.get(roomId);
@@ -97,6 +99,21 @@ wss.on('connection', (ws) => {
             case 'HOST_UNBAN_COMMENT':
                 handleHostUnbanComment(ws, room_id, user_id, data);
                 break;
+            case 'LOCK_SEAT':
+                handleLockSeat(ws, room_id, user_id, data);
+                break;
+            case 'UNLOCK_SEAT':
+                handleUnlockSeat(ws, room_id, user_id, data);
+                break;
+            case 'SELF_MUTE':
+                handleSelfMute(ws, room_id, user_id, data);
+                break;
+            case 'SELF_UNMUTE':
+                handleSelfUnmute(ws, room_id, user_id, data);
+                break;
+            case 'WEBRTC_SIGNAL':
+                handleWebRtcSignal(ws, room_id, user_id, data);
+                break;
             default:
                 console.warn(`[WARNING] Unknown event: ${event}`);
                 break;
@@ -137,10 +154,12 @@ function joinRoom(ws, roomId, userId, data) {
         user_id: userId,
         data: {
             seats: room.seats,
-            chat: room.chat.slice(-50), // last 50 messages
+            chat: room.chat.slice(-50),
             host_id: room.hostId,
             muted_users: Array.from(room.mutedUsers),
             banned_commenters: Array.from(room.bannedCommenters),
+            locked_seats: Array.from(room.lockedSeats),
+            self_muted_users: Array.from(room.selfMutedUsers),
         },
         timestamp: Date.now()
     };
@@ -180,7 +199,11 @@ function leaveRoom(ws, roomId, userId) {
             event: 'USER_LEFT',
             room_id: roomId,
             user_id: userId,
-            data: { seats: room.seats },
+            data: {
+                seats: room.seats,
+                locked_seats: Array.from(room.lockedSeats),
+                self_muted_users: Array.from(room.selfMutedUsers),
+            },
             timestamp: Date.now()
         }, ws);
     }
@@ -194,6 +217,9 @@ function handleTakeSeat(ws, roomId, userId, data) {
 
     // Check if seat is occupied
     if (room.seats[seatIndex] !== null) return;
+
+    // Locked seats can only be taken by the host
+    if (room.lockedSeats.has(seatIndex) && room.hostId !== userId) return;
 
     // Remove user from any current seat
     for (let i = 0; i < room.seats.length; i++) {
@@ -209,7 +235,11 @@ function handleTakeSeat(ws, roomId, userId, data) {
         event: 'SEAT_UPDATE',
         room_id: roomId,
         user_id: userId,
-        data: { seats: room.seats },
+        data: {
+            seats: room.seats,
+            locked_seats: Array.from(room.lockedSeats),
+            self_muted_users: Array.from(room.selfMutedUsers),
+        },
         timestamp: Date.now()
     });
 }
@@ -228,7 +258,11 @@ function handleLeaveSeat(ws, roomId, userId, data) {
         event: 'SEAT_UPDATE',
         room_id: roomId,
         user_id: userId,
-        data: { seats: room.seats },
+        data: {
+            seats: room.seats,
+            locked_seats: Array.from(room.lockedSeats),
+            self_muted_users: Array.from(room.selfMutedUsers),
+        },
         timestamp: Date.now()
     });
 }
@@ -282,7 +316,12 @@ function handleHostKick(ws, roomId, userId, data) {
         event: 'HOST_KICK',
         room_id: roomId,
         user_id: userId,
-        data: { target_user_id: targetUserId, seats: room.seats },
+        data: {
+            target_user_id: targetUserId,
+            seats: room.seats,
+            locked_seats: Array.from(room.lockedSeats),
+            self_muted_users: Array.from(room.selfMutedUsers),
+        },
         timestamp: Date.now()
     });
 }
@@ -357,6 +396,97 @@ function handleHostUnbanComment(ws, roomId, userId, data) {
         data: { target_user_id: targetUserId, banned_commenters: Array.from(room.bannedCommenters) },
         timestamp: Date.now()
     });
+}
+
+function handleLockSeat(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId !== userId) return;
+
+    const seatIndex = data?.seat_index;
+    if (typeof seatIndex !== 'number' || seatIndex < 0 || seatIndex >= MAX_SEATS) return;
+
+    room.lockedSeats.add(seatIndex);
+
+    broadcastToAll(roomId, {
+        event: 'LOCK_SEAT',
+        room_id: roomId,
+        user_id: userId,
+        data: { seat_index: seatIndex },
+        timestamp: Date.now()
+    });
+}
+
+function handleUnlockSeat(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId !== userId) return;
+
+    const seatIndex = data?.seat_index;
+    if (typeof seatIndex !== 'number' || seatIndex < 0 || seatIndex >= MAX_SEATS) return;
+
+    room.lockedSeats.delete(seatIndex);
+
+    broadcastToAll(roomId, {
+        event: 'UNLOCK_SEAT',
+        room_id: roomId,
+        user_id: userId,
+        data: { seat_index: seatIndex },
+        timestamp: Date.now()
+    });
+}
+
+function handleSelfMute(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    room.selfMutedUsers.add(userId);
+
+    broadcastToAll(roomId, {
+        event: 'SELF_MUTE',
+        room_id: roomId,
+        user_id: userId,
+        data: { user_id: userId },
+        timestamp: Date.now()
+    });
+}
+
+function handleSelfUnmute(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    room.selfMutedUsers.delete(userId);
+
+    broadcastToAll(roomId, {
+        event: 'SELF_UNMUTE',
+        room_id: roomId,
+        user_id: userId,
+        data: { user_id: userId },
+        timestamp: Date.now()
+    });
+}
+
+/// Routes a WebRTC signaling message to a specific user in the room.
+function handleWebRtcSignal(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    const targetUserId = data?.target_user_id;
+    if (!targetUserId) return;
+
+    for (const client of room.clients) {
+        if (client.userId === targetUserId && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                event: 'WEBRTC_SIGNAL',
+                room_id: roomId,
+                user_id: userId,
+                data: {
+                    target_user_id: targetUserId,
+                    signal_type: data.signal_type,
+                    signal_data: data.signal_data,
+                },
+                timestamp: Date.now()
+            }));
+            break;
+        }
+    }
 }
 
 function handleDisconnect(ws) {
