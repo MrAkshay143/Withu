@@ -173,9 +173,13 @@ function joinRoom(ws, roomId, userId, data) {
     const isHost = (roomId === userId);
     if (isHost) {
         room.hostId = userId;
-        // Always (re)place host in seat 0 – eject any non-host occupant
+        // Always ensure host occupies seat 0. Restore lost data if needed.
         const current = room.seats[0];
-        if (!current || current.user_id !== userId) {
+        if (current && current.user_id === userId) {
+            // Merge fresh userInfo (e.g. updated name/avatar) into the stored seat.
+            room.seats[0] = { ...current, ...userInfo };
+        } else {
+            // Seat 0 is empty or has stale data — (re-)assign it to the host.
             room.seats[0] = userInfo;
         }
     }
@@ -227,6 +231,22 @@ function joinRoom(ws, roomId, userId, data) {
         },
         timestamp: Date.now()
     }, ws);
+
+    // If this is the host rejoining, also broadcast a SEAT_UPDATE so all
+    // existing clients refresh seat 0 even if they missed the USER_JOINED.
+    if (isHost) {
+        broadcastToRoom(roomId, {
+            event: 'SEAT_UPDATE',
+            room_id: roomId,
+            user_id: userId,
+            data: {
+                seats: room.seats,
+                locked_seats: Array.from(room.lockedSeats),
+                self_muted_users: Array.from(room.selfMutedUsers),
+            },
+            timestamp: Date.now()
+        }, ws);
+    }
 }
 
 function leaveRoom(ws, roomId, userId) {
@@ -235,13 +255,24 @@ function leaveRoom(ws, roomId, userId) {
     room.clients.delete(ws);
     ws.rooms.delete(roomId);
 
-    // Remove from any seat – but NEVER clear seat 0 unless it is the host themselves
-    for (let i = 0; i < room.seats.length; i++) {
-        if (i === 0 && room.hostId === userId) {
-            // host left their own seat; clear it
-            room.seats[i] = null;
-        } else if (i !== 0 && room.seats[i] && room.seats[i].user_id === userId) {
-            room.seats[i] = null;
+    // Remove from any seat.
+    // Seat 0 is only cleared when the HOST themselves leaves — never for
+    // a non-host user who somehow ends up there, and never for a host
+    // whose userId we can't confirm (null/undefined on abrupt disconnect).
+    if (userId) {
+        for (let i = 0; i < room.seats.length; i++) {
+            const seat = room.seats[i];
+            if (!seat) continue;
+            if (i === 0) {
+                // Only clear seat 0 when the confirmed host is leaving.
+                if (room.hostId === userId && seat.user_id === userId) {
+                    room.seats[i] = null;
+                }
+            } else {
+                if (seat.user_id === userId) {
+                    room.seats[i] = null;
+                }
+            }
         }
     }
 
@@ -305,6 +336,11 @@ function handleTakeSeat(ws, roomId, userId, data) {
 function handleLeaveSeat(ws, roomId, userId, data) {
     if (!rooms.has(roomId)) return;
     const room = rooms.get(roomId);
+
+    // The host's seat 0 is permanent for the lifetime of the room.
+    // LEAVE_SEAT from the host is silently ignored — they can only vacate
+    // seat 0 by actually leaving the room (LEAVE_ROOM / disconnect).
+    if (room.hostId === userId) return;
 
     for (let i = 0; i < room.seats.length; i++) {
         if (room.seats[i] && room.seats[i].user_id === userId) {
