@@ -2,7 +2,10 @@ const WebSocket = require('ws');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
-const wss = new WebSocket.Server({ port: PORT });
+const wss = new WebSocket.Server({ 
+    host: '0.0.0.0',
+    port: PORT 
+});
 
 // Data structure to maintain rooms
 // rooms = { room_id: Set(client) }
