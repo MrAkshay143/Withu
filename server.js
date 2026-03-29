@@ -24,6 +24,13 @@ function getOrCreateRoom(roomId) {
             mutedUsers: new Set(),
             lockedSeats: new Set(),
             selfMutedUsers: new Set(),
+            // Real-time media state for catch-up when new users join
+            mediaState: {
+                url: null,
+                position: 0,
+                isPlaying: false,
+                updatedAt: Date.now(),
+            },
         });
     }
     return rooms.get(roomId);
@@ -70,10 +77,19 @@ wss.on('connection', (ws) => {
                 leaveRoom(ws, room_id, user_id);
                 break;
             case 'PLAY':
+                handlePlay(ws, room_id, user_id, data, parsedMessage);
+                break;
             case 'PAUSE':
+                handlePause(ws, room_id, user_id, data, parsedMessage);
+                break;
             case 'SEEK':
+                handleSeek(ws, room_id, user_id, data, parsedMessage);
+                break;
             case 'CHANGE_MEDIA':
-                broadcastToRoom(room_id, parsedMessage, ws);
+                handleChangeMedia(ws, room_id, user_id, data, parsedMessage);
+                break;
+            case 'POSITION_SYNC':
+                handlePositionSync(ws, room_id, user_id, data);
                 break;
             case 'TAKE_SEAT':
                 handleTakeSeat(ws, room_id, user_id, data);
@@ -147,7 +163,8 @@ function joinRoom(ws, roomId, userId, data) {
         }
     }
 
-    // Send ROOM_STATE to the joining client (full state sync)
+    // Send ROOM_STATE to the joining client (full state sync including current media)
+    const now = Date.now();
     const stateMsg = {
         event: 'ROOM_STATE',
         room_id: roomId,
@@ -160,8 +177,15 @@ function joinRoom(ws, roomId, userId, data) {
             banned_commenters: Array.from(room.bannedCommenters),
             locked_seats: Array.from(room.lockedSeats),
             self_muted_users: Array.from(room.selfMutedUsers),
+            // Include current media state so joining viewers can catch up
+            media_state: {
+                url: room.mediaState.url,
+                position: room.mediaState.position,
+                is_playing: room.mediaState.isPlaying,
+                server_ts: room.mediaState.updatedAt,
+            },
         },
-        timestamp: Date.now()
+        timestamp: now
     };
     if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify(stateMsg));
@@ -462,6 +486,73 @@ function handleSelfUnmute(ws, roomId, userId, data) {
         data: { user_id: userId },
         timestamp: Date.now()
     });
+}
+
+// ── Media playback handlers ────────────────────────────────────────────────
+// Only the host (room owner) may control playback.
+// Each handler updates the in-memory mediaState so late joiners can catch up,
+// then re-broadcasts the original message with a server_ts stamp so viewers
+// can compensate for network latency when seeking.
+
+function handlePlay(ws, roomId, userId, data, rawMsg) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId && room.hostId !== userId) return; // only host controls
+    const position = typeof data?.position === 'number' ? data.position : room.mediaState.position;
+    const now = Date.now();
+    room.mediaState.position = position;
+    room.mediaState.isPlaying = true;
+    room.mediaState.updatedAt = now;
+    broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+}
+
+function handlePause(ws, roomId, userId, data, rawMsg) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId && room.hostId !== userId) return;
+    const position = typeof data?.position === 'number' ? data.position : room.mediaState.position;
+    const now = Date.now();
+    room.mediaState.position = position;
+    room.mediaState.isPlaying = false;
+    room.mediaState.updatedAt = now;
+    broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+}
+
+function handleSeek(ws, roomId, userId, data, rawMsg) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId && room.hostId !== userId) return;
+    const position = typeof data?.position === 'number' ? data.position : room.mediaState.position;
+    const now = Date.now();
+    room.mediaState.position = position;
+    room.mediaState.updatedAt = now;
+    broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+}
+
+function handleChangeMedia(ws, roomId, userId, data, rawMsg) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId && room.hostId !== userId) return;
+    const now = Date.now();
+    room.mediaState.url = data?.media_url || null;
+    room.mediaState.position = 0;
+    room.mediaState.isPlaying = false;
+    room.mediaState.updatedAt = now;
+    broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+}
+
+// Silent host heartbeat — updates server position, NOT broadcast to clients.
+// This keeps the catch-up position accurate for future joiners without
+// triggering false seeks on connected viewers.
+function handlePositionSync(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId !== userId) return;
+    const position = data?.position;
+    if (typeof position !== 'number') return;
+    room.mediaState.position = position;
+    room.mediaState.updatedAt = Date.now();
+    // Not broadcast — purely a server-side state refresh
 }
 
 /// Routes a WebRTC signaling message to a specific user in the room.
