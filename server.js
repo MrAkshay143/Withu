@@ -32,6 +32,9 @@ wss.on('connection', (ws) => {
     ws.rooms = new Set();
     ws.userId = null;
     ws.userInfo = null; // { user_id, username, name, profile_pic }
+    ws.isAlive = true;
+
+    ws.on('pong', () => { ws.isAlive = true; });
     
     console.log(`[CONNECTED] Client ${ws.id}`);
 
@@ -90,6 +93,9 @@ wss.on('connection', (ws) => {
                 break;
             case 'HOST_BAN_COMMENT':
                 handleHostBanComment(ws, room_id, user_id, data);
+                break;
+            case 'HOST_UNBAN_COMMENT':
+                handleHostUnbanComment(ws, room_id, user_id, data);
                 break;
             default:
                 console.warn(`[WARNING] Unknown event: ${event}`);
@@ -335,6 +341,24 @@ function handleHostBanComment(ws, roomId, userId, data) {
     });
 }
 
+function handleHostUnbanComment(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId !== userId) return;
+
+    const targetUserId = data?.target_user_id;
+    if (!targetUserId) return;
+    room.bannedCommenters.delete(targetUserId);
+
+    broadcastToAll(roomId, {
+        event: 'HOST_UNBAN_COMMENT',
+        room_id: roomId,
+        user_id: userId,
+        data: { target_user_id: targetUserId, banned_commenters: Array.from(room.bannedCommenters) },
+        timestamp: Date.now()
+    });
+}
+
 function handleDisconnect(ws) {
     for (const roomId of ws.rooms) {
         leaveRoom(ws, roomId, ws.userId);
@@ -364,5 +388,20 @@ function broadcastToAll(roomId, messageObj) {
         }
     }
 }
+
+// ── Heartbeat: terminate dead connections every 30 s ────────────────
+const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (!ws.isAlive) {
+            ws.terminate();
+            return;
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
+wss.on('close', () => clearInterval(heartbeatInterval));
+
 
 console.log(`[SERVER] WebSocket sync server is running on port ${PORT}`);
