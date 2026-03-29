@@ -133,6 +133,15 @@ wss.on('connection', (ws) => {
             case 'WEBRTC_SIGNAL':
                 handleWebRtcSignal(ws, room_id, user_id, data);
                 break;
+            case 'REACTION':
+                handleReaction(ws, room_id, user_id, data);
+                break;
+            case 'HOST_REMOVE_SEAT':
+                handleHostRemoveSeat(ws, room_id, user_id, data);
+                break;
+            case 'HOST_SEAT_INVITE':
+                handleHostSeatInvite(ws, room_id, user_id, data);
+                break;
             default:
                 console.warn(`[WARNING] Unknown event: ${event}`);
                 break;
@@ -158,10 +167,11 @@ function joinRoom(ws, roomId, userId, data) {
 
     // If this is the room owner (roomId matches userId), they are the host
     const isHost = (roomId === userId);
-    if (isHost && !room.hostId) {
+    if (isHost) {
         room.hostId = userId;
-        // Auto-assign host to seat 0
-        if (room.seats[0] === null) {
+        // Always (re)place host in seat 0 – eject any non-host occupant
+        const current = room.seats[0];
+        if (!current || current.user_id !== userId) {
             room.seats[0] = userInfo;
         }
     }
@@ -180,6 +190,11 @@ function joinRoom(ws, roomId, userId, data) {
             banned_commenters: Array.from(room.bannedCommenters),
             locked_seats: Array.from(room.lockedSeats),
             self_muted_users: Array.from(room.selfMutedUsers),
+            // All other users currently in the room (excluding the joining user).
+            // Used by the client to show an accurate participant count on join.
+            participants: Array.from(room.clients)
+                .map(c => c.userId)
+                .filter(id => id && id !== userId),
             // Include current media state so joining viewers can catch up
             media_state: {
                 url: room.mediaState.url,
@@ -194,12 +209,17 @@ function joinRoom(ws, roomId, userId, data) {
         ws.send(JSON.stringify(stateMsg));
     }
 
-    // Broadcast USER_JOINED to others
+    // Broadcast USER_JOINED to others (include updated seats so host seat 0 is visible)
     broadcastToRoom(roomId, {
         event: 'USER_JOINED',
         room_id: roomId,
         user_id: userId,
-        data: { user_info: userInfo },
+        data: {
+            user_info: userInfo,
+            seats: room.seats,
+            locked_seats: Array.from(room.lockedSeats),
+            self_muted_users: Array.from(room.selfMutedUsers),
+        },
         timestamp: Date.now()
     }, ws);
 }
@@ -210,9 +230,12 @@ function leaveRoom(ws, roomId, userId) {
     room.clients.delete(ws);
     ws.rooms.delete(roomId);
 
-    // Remove from any seat
+    // Remove from any seat – but NEVER clear seat 0 unless it is the host themselves
     for (let i = 0; i < room.seats.length; i++) {
-        if (room.seats[i] && room.seats[i].user_id === userId) {
+        if (i === 0 && room.hostId === userId) {
+            // host left their own seat; clear it
+            room.seats[i] = null;
+        } else if (i !== 0 && room.seats[i] && room.seats[i].user_id === userId) {
             room.seats[i] = null;
         }
     }
@@ -242,13 +265,16 @@ function handleTakeSeat(ws, roomId, userId, data) {
     const seatIndex = data?.seat_index;
     if (typeof seatIndex !== 'number' || seatIndex < 0 || seatIndex >= MAX_SEATS) return;
 
+    // Seat 0 is strictly reserved for the room owner (host)
+    if (seatIndex === 0 && room.hostId !== userId) return;
+
     // Check if seat is occupied
     if (room.seats[seatIndex] !== null) return;
 
     // Locked seats can only be taken by the host
     if (room.lockedSeats.has(seatIndex) && room.hostId !== userId) return;
 
-    // Remove user from any current seat
+    // Remove user from any current seat (enforces single-seat per user)
     for (let i = 0; i < room.seats.length; i++) {
         if (room.seats[i] && room.seats[i].user_id === userId) {
             room.seats[i] = null;
@@ -362,13 +388,29 @@ function handleHostMute(ws, roomId, userId, data) {
     if (!targetUserId) return;
     room.mutedUsers.add(targetUserId);
 
+    const payload = { target_user_id: targetUserId, muted_users: Array.from(room.mutedUsers) };
     broadcastToAll(roomId, {
         event: 'HOST_MUTE',
         room_id: roomId,
         user_id: userId,
-        data: { target_user_id: targetUserId, muted_users: Array.from(room.mutedUsers) },
+        data: payload,
         timestamp: Date.now()
     });
+
+    // Also send a direct HOST_MUTED_YOU event to the silenced user so their
+    // device immediately disables the microphone track.
+    for (const client of room.clients) {
+        if (client.userId === targetUserId && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                event: 'HOST_MUTED_YOU',
+                room_id: roomId,
+                user_id: userId,
+                data: { muted: true },
+                timestamp: Date.now()
+            }));
+            break;
+        }
+    }
 }
 
 function handleHostUnmute(ws, roomId, userId, data) {
@@ -387,6 +429,20 @@ function handleHostUnmute(ws, roomId, userId, data) {
         data: { target_user_id: targetUserId, muted_users: Array.from(room.mutedUsers) },
         timestamp: Date.now()
     });
+
+    // Direct unmute notification to the target user
+    for (const client of room.clients) {
+        if (client.userId === targetUserId && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                event: 'HOST_MUTED_YOU',
+                room_id: roomId,
+                user_id: userId,
+                data: { muted: false },
+                timestamp: Date.now()
+            }));
+            break;
+        }
+    }
 }
 
 function handleHostBanComment(ws, roomId, userId, data) {
@@ -561,6 +617,73 @@ function handlePositionSync(ws, roomId, userId, data) {
     room.mediaState.position = position;
     room.mediaState.updatedAt = Date.now();
     // Not broadcast — purely a server-side state refresh
+}
+
+/// Removes a user from their seat (they remain in the room as a listener).
+function handleHostRemoveSeat(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId !== userId) return;
+
+    const targetUserId = data?.target_user_id;
+    if (!targetUserId || targetUserId === userId) return;
+
+    for (let i = 0; i < room.seats.length; i++) {
+        if (room.seats[i] && room.seats[i].user_id === targetUserId) {
+            room.seats[i] = null;
+        }
+    }
+
+    broadcastToAll(roomId, {
+        event: 'HOST_REMOVE_SEAT',
+        room_id: roomId,
+        user_id: userId,
+        data: {
+            target_user_id: targetUserId,
+            seats: room.seats,
+            locked_seats: Array.from(room.lockedSeats),
+            self_muted_users: Array.from(room.selfMutedUsers),
+        },
+        timestamp: Date.now()
+    });
+}
+
+/// Sends a seat invitation directly to a specific listener.
+function handleHostSeatInvite(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId !== userId) return;
+
+    const targetUserId = data?.target_user_id;
+    const seatIndex = data?.seat_index;
+    if (!targetUserId || seatIndex == null) return;
+
+    for (const client of room.clients) {
+        if (client.userId === targetUserId && client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({
+                event: 'HOST_SEAT_INVITE',
+                room_id: roomId,
+                user_id: userId,
+                data: { seat_index: seatIndex },
+                timestamp: Date.now()
+            }));
+            break;
+        }
+    }
+}
+
+/// Broadcasts a reaction/sticker emoji to everyone in the room.
+function handleReaction(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const emoji = data?.emoji;
+    if (!emoji) return;
+    broadcastToRoom(roomId, {
+        event: 'REACTION',
+        room_id: roomId,
+        user_id: userId,
+        data: { emoji },
+        timestamp: Date.now()
+    }, ws); // exclude sender – they already played it locally
 }
 
 /// Routes a WebRTC signaling message to a specific user in the room.
