@@ -218,6 +218,13 @@ function joinRoom(ws, roomId, userId, data) {
         ws.send(JSON.stringify(stateMsg));
     }
 
+    // If media is actively playing, push a live sync event directly to the joining
+    // viewer so they snap to the correct playback position without waiting for ROOM_STATE
+    // catch-up logic to fire. Skipped for the host — they control their own player.
+    if (!isHost) {
+        sendForceSyncToUser(ws, roomId, room);
+    }
+
     // Broadcast USER_JOINED to others (include updated seats so host seat 0 is visible)
     broadcastToRoom(roomId, {
         event: 'USER_JOINED',
@@ -310,15 +317,19 @@ function handleTakeSeat(ws, roomId, userId, data) {
     // Locked seats can only be taken by the host
     if (room.lockedSeats.has(seatIndex) && room.hostId !== userId) return;
 
-    // Remove user from any current seat (enforces single-seat per user)
+    // Remove user from any current seat (enforces single-seat per user).
+    // Seat 0 is the host's permanent seat — never auto-vacate it here.
     for (let i = 0; i < room.seats.length; i++) {
+        if (i === 0) continue;
         if (room.seats[i] && room.seats[i].user_id === userId) {
+            console.log(`[SEAT] Clearing previous seat ${i} for ${userId} (taking seat ${seatIndex})`);
             room.seats[i] = null;
         }
     }
 
     const userInfo = data?.user_info || ws.userInfo || { user_id: userId };
     room.seats[seatIndex] = userInfo;
+    console.log(`[SEAT] ${userId} took seat ${seatIndex} in room ${roomId}`);
 
     broadcastToAll(roomId, {
         event: 'SEAT_UPDATE',
@@ -331,6 +342,11 @@ function handleTakeSeat(ws, roomId, userId, data) {
         },
         timestamp: Date.now()
     });
+
+    // Push live media state to the user who just sat down so audio stays in sync.
+    if (room.hostId !== userId) {
+        sendForceSyncToUser(ws, roomId, room);
+    }
 }
 
 function handleLeaveSeat(ws, roomId, userId, data) {
@@ -399,9 +415,11 @@ function handleHostKick(ws, roomId, userId, data) {
     const targetUserId = data?.target_user_id;
     if (!targetUserId || targetUserId === userId) return;
 
-    // Remove from seat
+    // Remove from seat. Seat 0 is host-only — never cleared by a kick.
     for (let i = 0; i < room.seats.length; i++) {
+        if (i === 0) continue;
         if (room.seats[i] && room.seats[i].user_id === targetUserId) {
+            console.log(`[SEAT] Host kicked ${targetUserId} from seat ${i} in room ${roomId}`);
             room.seats[i] = null;
         }
     }
@@ -684,8 +702,11 @@ function handleHostRemoveSeat(ws, roomId, userId, data) {
     const targetUserId = data?.target_user_id;
     if (!targetUserId || targetUserId === userId) return;
 
+    // Seat 0 is host-only — never cleared by HOST_REMOVE_SEAT.
     for (let i = 0; i < room.seats.length; i++) {
+        if (i === 0) continue;
         if (room.seats[i] && room.seats[i].user_id === targetUserId) {
+            console.log(`[SEAT] Host removed ${targetUserId} from seat ${i} in room ${roomId}`);
             room.seats[i] = null;
         }
     }
@@ -728,18 +749,19 @@ function handleHostSeatInvite(ws, roomId, userId, data) {
     }
 }
 
-/// Broadcasts a reaction/sticker emoji to everyone in the room.
+/// Broadcasts a reaction/sticker emoji to everyone in the room including the sender,
+/// so the sender also sees their own reaction animate on screen.
 function handleReaction(ws, roomId, userId, data) {
     if (!rooms.has(roomId)) return;
     const emoji = data?.emoji;
     if (!emoji) return;
-    broadcastToRoom(roomId, {
+    broadcastToAll(roomId, {
         event: 'REACTION',
         room_id: roomId,
         user_id: userId,
         data: { emoji },
         timestamp: Date.now()
-    }, ws); // exclude sender – they already played it locally
+    });
 }
 
 /// Routes a WebRTC signaling message to a specific user in the room.
@@ -765,6 +787,32 @@ function handleWebRtcSignal(ws, roomId, userId, data) {
             break;
         }
     }
+}
+
+// ── FORCE_PLAY_SYNC helper ────────────────────────────────────────────────
+// Sends a targeted playback-sync event directly to a single client so their
+// player snaps to the live position immediately after join or seat-take.
+// Only fires when media is actively playing; no-ops otherwise.
+function sendForceSyncToUser(ws, roomId, room) {
+    if (!room.mediaState.url || !room.mediaState.isPlaying) return;
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const now = Date.now();
+    // Add server-side elapsed time so the client receives a live position.
+    const elapsed = Math.max(0, (now - room.mediaState.updatedAt) / 1000);
+    const livePosition = room.mediaState.position + elapsed;
+    console.log(`[FORCE_PLAY_SYNC] → ${ws.userId} pos=${livePosition.toFixed(2)}s url=${room.mediaState.url}`);
+    ws.send(JSON.stringify({
+        event: 'FORCE_PLAY_SYNC',
+        room_id: roomId,
+        user_id: room.hostId || 'server',
+        data: {
+            media_url: room.mediaState.url,
+            position: livePosition,
+            is_playing: true,
+            server_ts: now,
+        },
+        timestamp: now,
+    }));
 }
 
 function handleDisconnect(ws) {
