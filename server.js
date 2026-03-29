@@ -29,6 +29,7 @@ function getOrCreateRoom(roomId) {
                 url: null,
                 position: 0,
                 isPlaying: false,
+                volume: 1.0,
                 updatedAt: Date.now(),
             },
         });
@@ -90,6 +91,9 @@ wss.on('connection', (ws) => {
                 break;
             case 'CHANGE_MEDIA':
                 handleChangeMedia(ws, room_id, user_id, data, parsedMessage);
+                break;
+            case 'VOLUME_CHANGE':
+                handleVolumeChange(ws, room_id, user_id, data, parsedMessage);
                 break;
             case 'POSITION_SYNC':
                 handlePositionSync(ws, room_id, user_id, data);
@@ -200,6 +204,7 @@ function joinRoom(ws, roomId, userId, data) {
                 url: room.mediaState.url,
                 position: room.mediaState.position,
                 is_playing: room.mediaState.isPlaying,
+                volume: room.mediaState.volume,
                 server_ts: room.mediaState.updatedAt,
             },
         },
@@ -603,6 +608,21 @@ function handleChangeMedia(ws, roomId, userId, data, rawMsg) {
     room.mediaState.isPlaying = false;
     room.mediaState.updatedAt = now;
     broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+}
+
+function handleVolumeChange(ws, roomId, userId, data, rawMsg) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    if (room.hostId !== userId) return; // only host controls volume
+    const volume = typeof data?.volume === 'number' ? Math.min(1.0, Math.max(0.0, data.volume)) : 1.0;
+    room.mediaState.volume = volume;
+    broadcastToRoom(roomId, {
+        event: 'VOLUME_CHANGE',
+        room_id: roomId,
+        user_id: userId,
+        data: { volume },
+        timestamp: Date.now()
+    }, ws);
 }
 
 // Silent host heartbeat — updates server position, NOT broadcast to clients.
