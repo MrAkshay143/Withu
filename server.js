@@ -67,7 +67,10 @@ wss.on('connection', (ws) => {
         if (data && data.user_info) {
             ws.userInfo = data.user_info;
         }
-        console.log(`[EVENT] ${event} from ${user_id} in room ${room_id}`);
+        // Skip high-frequency heartbeat events to keep logs readable
+        if (event !== 'POSITION_SYNC') {
+            console.log(`[EVENT] ${event} from ${user_id} in room ${room_id}`);
+        }
 
         switch (event) {
             case 'JOIN_ROOM':
@@ -503,7 +506,10 @@ function handlePlay(ws, roomId, userId, data, rawMsg) {
     room.mediaState.position = position;
     room.mediaState.isPlaying = true;
     room.mediaState.updatedAt = now;
-    broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+    // Embed server_ts inside data so Flutter can read it via event.data['server_ts']
+    // and compute precise latency-compensated seek positions for viewers.
+    const enrichedData = { ...(rawMsg.data || {}), position, server_ts: now };
+    broadcastToRoom(roomId, { ...rawMsg, data: enrichedData, server_ts: now }, ws);
 }
 
 function handlePause(ws, roomId, userId, data, rawMsg) {
@@ -515,7 +521,8 @@ function handlePause(ws, roomId, userId, data, rawMsg) {
     room.mediaState.position = position;
     room.mediaState.isPlaying = false;
     room.mediaState.updatedAt = now;
-    broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+    const enrichedData = { ...(rawMsg.data || {}), position, server_ts: now };
+    broadcastToRoom(roomId, { ...rawMsg, data: enrichedData, server_ts: now }, ws);
 }
 
 function handleSeek(ws, roomId, userId, data, rawMsg) {
@@ -526,7 +533,8 @@ function handleSeek(ws, roomId, userId, data, rawMsg) {
     const now = Date.now();
     room.mediaState.position = position;
     room.mediaState.updatedAt = now;
-    broadcastToRoom(roomId, { ...rawMsg, server_ts: now }, ws);
+    const enrichedData = { ...(rawMsg.data || {}), position, server_ts: now };
+    broadcastToRoom(roomId, { ...rawMsg, data: enrichedData, server_ts: now }, ws);
 }
 
 function handleChangeMedia(ws, roomId, userId, data, rawMsg) {
