@@ -10,6 +10,9 @@ const wss = new WebSocket.Server({
 // rooms = { room_id: { clients: Set(ws), seats: Array(10), chat: Array, hostId: string } }
 const rooms = new Map();
 
+// Global presence: { userId → ws } — tracks every identified connected client
+const onlineUsers = new Map();
+
 const MAX_SEATS = 10;
 const MAX_CHAT = 200;
 
@@ -67,6 +70,11 @@ wss.on('connection', (ws) => {
         ws.userId = user_id;
         if (data && data.user_info) {
             ws.userInfo = data.user_info;
+        }
+        // Register/update global presence when we learn the userId
+        if (!onlineUsers.has(user_id) || onlineUsers.get(user_id) !== ws) {
+            onlineUsers.set(user_id, ws);
+            broadcastPresenceUpdate();
         }
         // Skip high-frequency heartbeat events to keep logs readable
         if (event !== 'POSITION_SYNC') {
@@ -149,6 +157,9 @@ wss.on('connection', (ws) => {
             case 'SPEAKING':
                 handleSpeaking(ws, room_id, user_id, data);
                 break;
+            case 'REGISTER_PRESENCE':
+                handleRegisterPresence(ws);
+                break;
             default:
                 console.warn(`[WARNING] Unknown event: ${event}`);
                 break;
@@ -169,6 +180,8 @@ function joinRoom(ws, roomId, userId, data) {
     const room = getOrCreateRoom(roomId);
     room.clients.add(ws);
     ws.rooms.add(roomId);
+    // Broadcast live member count to all clients (home screen LIVE badge)
+    broadcastRoomCount(roomId, room.clients.size);
 
     const userInfo = data?.user_info || { user_id: userId };
 
@@ -286,6 +299,7 @@ function leaveRoom(ws, roomId, userId) {
         }
     }
 
+    const countAfterLeave = room.clients.size;
     if (room.clients.size === 0) {
         // Clear room entirely when empty
         rooms.delete(roomId);
@@ -303,6 +317,8 @@ function leaveRoom(ws, roomId, userId) {
             timestamp: Date.now()
         }, ws);
     }
+    // Broadcast live member count (0 when room is now empty)
+    broadcastRoomCount(roomId, countAfterLeave);
 }
 
 function handleTakeSeat(ws, roomId, userId, data) {
@@ -858,8 +874,60 @@ function sendForceSyncToUser(ws, roomId, room) {
 }
 
 function handleDisconnect(ws) {
+    if (ws.userId && onlineUsers.get(ws.userId) === ws) {
+        onlineUsers.delete(ws.userId);
+        broadcastPresenceUpdate();
+    }
     for (const roomId of ws.rooms) {
         leaveRoom(ws, roomId, ws.userId);
+    }
+}
+
+// ── Presence helpers ─────────────────────────────────────────────────────────
+
+/// Sends current online user list to all connected clients.
+function broadcastPresenceUpdate() {
+    const online = Array.from(onlineUsers.keys());
+    const msg = JSON.stringify({
+        event: 'PRESENCE_UPDATE',
+        data: { online_users: online },
+        timestamp: Date.now(),
+    });
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(msg);
+        }
+    }
+}
+
+/// Sends a snapshot of online users + all room counts to a single joining client.
+function handleRegisterPresence(ws) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    const counts = {};
+    for (const [rId, room] of rooms) {
+        counts[rId] = room.clients.size;
+    }
+    ws.send(JSON.stringify({
+        event: 'PRESENCE_SNAPSHOT',
+        data: {
+            online_users: Array.from(onlineUsers.keys()),
+            room_counts: counts,
+        },
+        timestamp: Date.now(),
+    }));
+}
+
+/// Broadcasts live member count for a single room to all connected clients.
+function broadcastRoomCount(roomId, count) {
+    const msg = JSON.stringify({
+        event: 'ROOM_COUNT_UPDATE',
+        data: { room_id: roomId, count },
+        timestamp: Date.now(),
+    });
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(msg);
+        }
     }
 }
 
