@@ -318,18 +318,31 @@ function handleTakeSeat(ws, roomId, userId, data) {
     if (room.lockedSeats.has(seatIndex) && room.hostId !== userId) return;
 
     // Remove user from any current seat (enforces single-seat per user).
-    // Seat 0 is the host's permanent seat — never auto-vacate it here.
+    // This applies to all seats including seat 0 — when a user takes a new seat,
+    // they must be removed from their previous seat (if any), ensuring 1 user = 1 seat.
+    let previousSeatIndex = -1;
     for (let i = 0; i < room.seats.length; i++) {
-        if (i === 0) continue;
         if (room.seats[i] && room.seats[i].user_id === userId) {
             console.log(`[SEAT] Clearing previous seat ${i} for ${userId} (taking seat ${seatIndex})`);
+            previousSeatIndex = i;
             room.seats[i] = null;
         }
     }
 
     const userInfo = data?.user_info || ws.userInfo || { user_id: userId };
     room.seats[seatIndex] = userInfo;
-    console.log(`[SEAT] ${userId} took seat ${seatIndex} in room ${roomId}`);
+    console.log(`[SEAT] ${userId} took seat ${seatIndex} in room ${roomId}${previousSeatIndex >= 0 ? ` (vacated seat ${previousSeatIndex})` : ''}`);
+
+    // Verify no duplicate seats for this user (safeguard against race conditions)
+    let seatCount = 0;
+    for (let i = 0; i < room.seats.length; i++) {
+        if (room.seats[i] && room.seats[i].user_id === userId) {
+            seatCount++;
+        }
+    }
+    if (seatCount > 1) {
+        console.error(`[SEAT ERROR] User ${userId} has ${seatCount} seats! This should never happen.`);
+    }
 
     broadcastToAll(roomId, {
         event: 'SEAT_UPDATE',
