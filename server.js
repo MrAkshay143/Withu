@@ -695,18 +695,28 @@ function handleVolumeChange(ws, roomId, userId, data, rawMsg) {
     }, ws);
 }
 
-// Silent host heartbeat — updates server position, NOT broadcast to clients.
-// This keeps the catch-up position accurate for future joiners without
-// triggering false seeks on connected viewers.
+// Host heartbeat — updates server position AND broadcasts a soft drift-correction
+// nudge to all connected viewers. Viewers whose player has drifted more than 1.5s
+// (e.g. after a buffering pause) will seek to re-sync; in-sync viewers ignore it.
 function handlePositionSync(ws, roomId, userId, data) {
     if (!rooms.has(roomId)) return;
     const room = rooms.get(roomId);
     if (room.hostId !== userId) return;
     const position = data?.position;
     if (typeof position !== 'number') return;
+    const now = Date.now();
     room.mediaState.position = position;
-    room.mediaState.updatedAt = Date.now();
-    // Not broadcast — purely a server-side state refresh
+    room.mediaState.updatedAt = now;
+    // Only broadcast while playing so paused viewers don't get unexpected seeks.
+    if (room.mediaState.isPlaying) {
+        broadcastToRoom(roomId, {
+            event: 'POSITION_SYNC',
+            room_id: roomId,
+            user_id: userId,
+            data: { position, server_ts: now },
+            timestamp: now,
+        }, ws); // exclude the sender (host)
+    }
 }
 
 /// Removes a user from their seat (they remain in the room as a listener).
