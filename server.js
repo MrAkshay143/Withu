@@ -146,6 +146,9 @@ wss.on('connection', (ws) => {
             case 'HOST_SEAT_INVITE':
                 handleHostSeatInvite(ws, room_id, user_id, data);
                 break;
+            case 'SPEAKING':
+                handleSpeaking(ws, room_id, user_id, data);
+                break;
             default:
                 console.warn(`[WARNING] Unknown event: ${event}`);
                 break;
@@ -773,6 +776,22 @@ function handleReaction(ws, roomId, userId, data) {
         room_id: roomId,
         user_id: userId,
         data: { emoji },
+        timestamp: Date.now()
+    });
+}
+
+/// Broadcast real-time speaking state so all clients can animate the seat border.
+function handleSpeaking(ws, roomId, userId, data) {
+    if (!rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+    // Only seated users may broadcast speaking state.
+    const isSeated = room.seats.some(s => s && s.user_id === userId);
+    if (!isSeated) return;
+    broadcastToAll(roomId, {
+        event: 'SPEAKING',
+        room_id: roomId,
+        user_id: userId,
+        data: { speaking: Boolean(data?.speaking) },
         timestamp: Date.now()
     });
 }
